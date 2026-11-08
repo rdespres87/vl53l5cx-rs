@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  check-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv7em-none-eabihf, riscv32imac-unknown-none-elf
+          components: rustfmt, clippy
+
+      - name: Formatting Check
+        run: cargo fmt --all -- --check
+
+      - name: Host Check (No Default Features)
+        run: cargo check --no-default-features
+
+      - name: Host Unit Tests (Default Features)
+        run: cargo test
+
+      - name: Host Unit Tests (All Features)
+        run: cargo test --all-features
+
+      - name: Clippy (Host, All Features, Warnings Denied)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Cross-compile ARM Cortex-M4F (#![no_std], No Default Features)
+        run: cargo check --target thumbv7em-none-eabihf --no-default-features
+
+      - name: Cross-compile ARM Cortex-M4F (#![no_std], Default Features)
+        run: cargo check --target thumbv7em-none-eabihf
+
+      - name: Cross-compile ARM Cortex-M4F (#![no_std], All Features)
+        run: cargo check --target thumbv7em-none-eabihf --all-features
+
+      - name: Cross-compile RISC-V 32-bit (#![no_std], Default Features)
+        run: cargo check --target riscv32imac-unknown-none-elf
+
+      - name: Cross-compile RISC-V 32-bit (#![no_std], All Features)
+        run: cargo check --target riscv32imac-unknown-none-elf --all-features
+
+      - name: Documentation Build
+        run: cargo doc --all-features --no-deps
