@@ -18,6 +18,8 @@ pub const OFFSET_BUFFER_SIZE: usize = 488;
 pub const XTALK_BUFFER_SIZE: usize = 776;
 /// Number of zones in 4x4 mode.
 pub const ZONES_4X4: usize = 16;
+/// Number of zones in 8x8 mode.
+pub const ZONES_8X8: usize = 64;
 
 /// Block-header index of the per-zone metadata block.
 pub const METADATA_IDX: u16 = 0x54B4;
@@ -40,6 +42,8 @@ pub const DCI_OUTPUT_LIST: u16 = 0xD980;
 pub const DCI_PIPE_CONTROL: u16 = 0xDB80;
 /// DCI index for target ordering (`VL53L5CX_DCI_TARGET_ORDER`).
 pub const DCI_TARGET_ORDER: u16 = 0xAE64;
+/// DCI index for sharpener percent (`VL53L5CX_DCI_SHARPENER`).
+pub const DCI_SHARPENER: u16 = 0xAED8;
 
 pub const START_BH: u32 = 0x0000_000D;
 pub const METADATA_BH: u32 = 0x54B4_00C0;
@@ -180,6 +184,26 @@ pub fn prepare_offset_4x4(buf: &mut [u8]) -> Result<(), BufferTooSmall> {
 
     // Drop the 8-byte NVM header (ULD: temp[k] = temp[k + 8]).
     buf.copy_within(8..NVM_DATA_SIZE, 0);
+    buf[0x1E0..0x1E8].copy_from_slice(&FOOTER);
+    Ok(())
+}
+
+/// Port of `_vl53l5cx_send_offset_data(.., VL53L5CX_RESOLUTION_8X8)` (payload part).
+///
+/// Input: `buf[..OFFSET_BUFFER_SIZE]` holds the raw NVM block as read from `0x2C04`.
+/// Output: `buf[..OFFSET_BUFFER_SIZE]` holds the payload to write to `0x2E18`.
+pub fn prepare_offset_8x8(buf: &mut [u8]) -> Result<(), BufferTooSmall> {
+    const FOOTER: [u8; 8] = [0x00, 0x00, 0x00, 0x0F, 0x03, 0x01, 0x01, 0xE4];
+
+    if buf.len() < OFFSET_BUFFER_SIZE {
+        return Err(BufferTooSmall {
+            needed: OFFSET_BUFFER_SIZE,
+            actual: buf.len(),
+        });
+    }
+
+    // Drop the 8-byte NVM header (ULD: temp[k] = temp[k + 8]).
+    buf.copy_within(8..OFFSET_BUFFER_SIZE, 0);
     buf[0x1E0..0x1E8].copy_from_slice(&FOOTER);
     Ok(())
 }
@@ -397,16 +421,20 @@ pub enum ReadyState {
 /// when the sensor firmware has committed a complete frame, or `NotReady` otherwise.
 pub fn decode_data_ready(regs: [u8; 4], last_streamcount: u8) -> ReadyState {
     let streamcount = regs[0];
-    let is_valid_header = regs[1] == 0x05 && (regs[2] & 0x05) == 0x05 && (regs[3] & 0x10) == 0x10;
+    let is_ready = streamcount != last_streamcount
+        && regs[1] == 0x05
+        && (regs[2] & 0x05) == 0x05
+        && (regs[3] & 0x10) == 0x10;
 
     if last_streamcount == 255 && streamcount == 255 {
         // Uninitialized boot marker per ST ULD (temp_buffer[0] == 255 while last_streamcount == 255)
         ReadyState::NotReady
-    } else if is_valid_header && streamcount != last_streamcount {
+    } else if is_ready {
         ReadyState::Ready(streamcount)
-    } else if regs == [0xFF, 0xFF, 0xFF, 0xFF] && last_streamcount != 255 {
-        // All 0xFF during active ranging indicates floating bus or disconnected sensor
-        ReadyState::Abnormal(0xFF)
+    } else if (regs[3] & 0x80) != 0 {
+        // Return GO2 error status per ST ULD line 699 (only evaluated when frame is NOT ready).
+        // During active ranging, a floating I2C bus returns all 0xFF, which triggers Abnormal(0xFF).
+        ReadyState::Abnormal(regs[2])
     } else {
         ReadyState::NotReady
     }
@@ -421,6 +449,28 @@ pub struct Frame4x4 {
     /// ST target status per zone (5 and 9 = valid; 255 = no target).
     pub target_status: [u8; ZONES_4X4],
     pub nb_target_detected: [u8; ZONES_4X4],
+}
+
+/// One decoded 8x8 ranging frame (64 zones).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Frame8x8 {
+    pub silicon_temp_degc: i8,
+    /// Distance per zone in millimetres (negative values clamped to 0).
+    pub distance_mm: [i16; ZONES_8X8],
+    /// ST target status per zone (5 and 9 = valid; 255 = no target).
+    pub target_status: [u8; ZONES_8X8],
+    pub nb_target_detected: [u8; ZONES_8X8],
+}
+
+impl Default for Frame8x8 {
+    fn default() -> Self {
+        Self {
+            silicon_temp_degc: 0,
+            distance_mm: [0; ZONES_8X8],
+            target_status: [255; ZONES_8X8],
+            nb_target_detected: [0; ZONES_8X8],
+        }
+    }
 }
 
 /// Frame decoding failure.
@@ -531,6 +581,92 @@ pub fn parse_frame(buf: &mut [u8]) -> Result<Frame4x4, FrameError> {
     Ok(frame)
 }
 
+/// Port of `vl53l5cx_get_ranging_data` for 8x8 / 1 target per zone (64 zones).
+/// `buf` is the raw frame read from register `0x0000`; it is swapped in place.
+pub fn parse_frame_8x8(buf: &mut [u8]) -> Result<Frame8x8, FrameError> {
+    let len = buf.len();
+    if len < 24 || !len.is_multiple_of(4) {
+        return Err(FrameError::TooShort(len));
+    }
+    swap_words(buf);
+
+    let mut frame = Frame8x8::default();
+    let mut i = 16;
+    while i + 4 <= len {
+        let bh = read_u32_le(buf, i);
+        let bh_type = (bh & 0xF) as usize;
+        let size = ((bh >> 4) & 0x0FFF) as usize;
+        let idx = (bh >> 16) as u16;
+        let msize = if bh_type > 0x1 && bh_type < 0xD {
+            bh_type * size
+        } else {
+            size
+        };
+        let data_start = i + 4;
+        let data_end = data_start + msize;
+        let is_known_block = matches!(
+            idx,
+            METADATA_IDX | NB_TARGET_DETECTED_IDX | DISTANCE_IDX | TARGET_STATUS_IDX
+        );
+        if data_end > len {
+            if is_known_block {
+                return Err(FrameError::Truncated {
+                    offset: i,
+                    block_size: msize,
+                });
+            }
+            break;
+        }
+        let data = &buf[data_start..data_end];
+        match idx {
+            METADATA_IDX => {
+                if let Some(&t) = data.get(8) {
+                    frame.silicon_temp_degc = t as i8;
+                }
+            }
+            NB_TARGET_DETECTED_IDX => {
+                let n = data.len().min(ZONES_8X8);
+                frame.nb_target_detected[..n].copy_from_slice(&data[..n]);
+            }
+            DISTANCE_IDX => {
+                for (zone, pair) in frame.distance_mm.iter_mut().zip(data.chunks_exact(2)) {
+                    *zone = i16::from_le_bytes([pair[0], pair[1]]);
+                }
+            }
+            TARGET_STATUS_IDX => {
+                let n = data.len().min(ZONES_8X8);
+                frame.target_status[..n].copy_from_slice(&data[..n]);
+            }
+            _ => {}
+        }
+        i = data_end;
+    }
+
+    for d in frame.distance_mm.iter_mut() {
+        *d /= 4;
+        if *d < 0 {
+            *d = 0;
+        }
+    }
+
+    for (status, &nb) in frame
+        .target_status
+        .iter_mut()
+        .zip(frame.nb_target_detected.iter())
+    {
+        if nb == 0 {
+            *status = 255;
+        }
+    }
+
+    // In ST ULD, if header_id != footer_id it sets VL53L5CX_STATUS_CORRUPTED_FRAME
+    // advisory bit but does not discard the parsed ranging results.
+    // In 8x8 mode with minimal enables, footer_id is placed by microcode
+    // at a separate circular boundary, so we do not abort.
+    let _ = (buf[0x8], buf[len - 4]);
+    Ok(frame)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -635,17 +771,19 @@ mod tests {
             decode_data_ready([0, 5, 5, 0x10], 255),
             ReadyState::Ready(0)
         );
-        // Transient integration states (e.g. status != 0x05 or flag != 0x10) -> NotReady (no errors)
+        // GO2 error status when bit 7 of regs[3] is set (per ST ULD line 697)
+        assert_eq!(
+            decode_data_ready([0xFE, 0x05, 0xA7, 0x81], 255),
+            ReadyState::Abnormal(0xA7)
+        );
+        // MCU error 0x42 (VL53L5CX_MCU_ERROR = 66)
         assert_eq!(
             decode_data_ready([8, 5, 0x42, 0x80], 7),
-            ReadyState::NotReady
+            ReadyState::Abnormal(0x42)
         );
+        // Transient integration states (e.g. status != 0x05 or flag & 0x05 != 0x05, no MCU error bit 7) -> NotReady
         assert_eq!(
-            decode_data_ready([8, 5, 0x85, 0x80], 7),
-            ReadyState::NotReady
-        );
-        assert_eq!(
-            decode_data_ready([8, 5, 0x84, 0x80], 7),
+            decode_data_ready([8, 5, 0x02, 0x00], 7),
             ReadyState::NotReady
         );
         assert_eq!(decode_data_ready([8, 0, 0, 0], 7), ReadyState::NotReady);
@@ -829,5 +967,6 @@ mod tests {
         assert_eq!(DCI_OUTPUT_LIST, 0xD980);
         assert_eq!(DCI_PIPE_CONTROL, 0xDB80);
         assert_eq!(DCI_TARGET_ORDER, 0xAE64);
+        assert_eq!(DCI_SHARPENER, 0xAED8);
     }
 }

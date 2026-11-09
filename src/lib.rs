@@ -1,4 +1,5 @@
 #![no_std]
+#![allow(unknown_lints)]
 #![allow(clippy::chunks_exact_to_as_chunks)]
 
 //! Native ST VL53L5CX 3D multi-zone Time-of-Flight driver.
@@ -14,7 +15,7 @@
 
 pub mod codec;
 
-pub use codec::{Frame4x4, FrameError};
+pub use codec::{Frame4x4, Frame8x8, FrameError};
 
 /// Factory I2C address (7-bit).
 pub const DEFAULT_ADDR: u8 = 0x29;
@@ -73,6 +74,7 @@ pub const DCI_PIPE_CONTROL: u16 = 0xDB80;
 pub const DCI_GLARE_FILTER: u16 = 0xE108;
 pub const DCI_UI_RANGE_DATA: u16 = 0x5440;
 pub const DCI_TARGET_ORDER: u16 = 0xAE64;
+pub const DCI_SHARPENER: u16 = 0xAED8;
 
 /// Target ordering within each multi-target detection zone (ST ULD `vl53l5cx_set_target_order`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -283,6 +285,7 @@ pub struct Vl53l5cx<BUS, DELAY> {
     delay: DELAY,
     addr: u8,
     temp: [u8; TEMP_SIZE],
+    offset_data: [u8; codec::OFFSET_BUFFER_SIZE],
     streamcount: u8,
     data_read_size: usize,
 }
@@ -295,6 +298,7 @@ impl<BUS: I2c, DELAY: DelayNs> Vl53l5cx<BUS, DELAY> {
             delay,
             addr,
             temp: [0u8; TEMP_SIZE],
+            offset_data: [0u8; codec::OFFSET_BUFFER_SIZE],
             streamcount: 255,
             data_read_size: 0,
         }
@@ -606,6 +610,7 @@ impl<BUS: I2c, DELAY: DelayNs> Vl53l5cx<BUS, DELAY> {
         self.write_slice(0x2FD8, GET_NVM_CMD)?;
         self.poll_for_answer(4, 0, UI_CMD_STATUS, 0xFF, 0x02)?;
         self.read_temp(UI_CMD_START, codec::NVM_DATA_SIZE)?;
+        self.offset_data.copy_from_slice(&self.temp[..codec::OFFSET_BUFFER_SIZE]);
         codec::prepare_offset_4x4(&mut self.temp).map_err(|_| Error::InvalidParam)?;
         self.write_temp(0x2E18, codec::OFFSET_BUFFER_SIZE)?;
         self.poll_for_answer(4, 1, UI_CMD_STATUS, 0xFF, 0x03)?;
@@ -646,6 +651,37 @@ impl<BUS: I2c, DELAY: DelayNs> Vl53l5cx<BUS, DELAY> {
         zone[0x04] = 8;
         zone[0x05] = 8;
         self.dci_write(DCI_ZONE_CONFIG, &zone)?;
+
+        Ok(())
+    }
+
+    /// Sets sensor resolution to 8x8 (64 zones).
+    pub fn set_resolution_8x8(&mut self) -> Result<(), Error<BUS::Error>> {
+        let mut dss = [0u8; 16];
+        self.dci_read(DCI_DSS_CONFIG, &mut dss)?;
+        dss[0x04] = 16;
+        dss[0x06] = 16;
+        dss[0x09] = 1;
+        self.dci_write(DCI_DSS_CONFIG, &dss)?;
+
+        let mut zone = [0u8; 8];
+        self.dci_read(DCI_ZONE_CONFIG, &mut zone)?;
+        zone[0x00] = 8;
+        zone[0x01] = 8;
+        zone[0x04] = 4;
+        zone[0x05] = 4;
+        self.dci_write(DCI_ZONE_CONFIG, &zone)?;
+
+        // Send 8x8 offset calibration data per ST ULD lines 953 and 143-152
+        self.temp[..codec::OFFSET_BUFFER_SIZE].copy_from_slice(&self.offset_data);
+        codec::prepare_offset_8x8(&mut self.temp).map_err(|_| Error::InvalidParam)?;
+        self.write_temp(0x2E18, codec::OFFSET_BUFFER_SIZE)?;
+        self.poll_for_answer(4, 1, UI_CMD_STATUS, 0xFF, 0x03)?;
+
+        // Send 8x8 default Xtalk data per ST ULD lines 954 and 209-212
+        self.temp[..codec::XTALK_BUFFER_SIZE].copy_from_slice(DEFAULT_XTALK);
+        self.write_temp(0x2CF8, codec::XTALK_BUFFER_SIZE)?;
+        self.poll_for_answer(4, 1, UI_CMD_STATUS, 0xFF, 0x03)?;
 
         Ok(())
     }
@@ -691,12 +727,33 @@ impl<BUS: I2c, DELAY: DelayNs> Vl53l5cx<BUS, DELAY> {
         }
     }
 
-    /// Starts continuous ranging with 4x4 configuration.
+    /// Sets the sharpener percentage (0% to 99%) to filter optical crosstalk and veiling glare.
+    ///
+    /// Corresponds to ST ULD `vl53l5cx_set_sharpener_percent`.
+    pub fn set_sharpener_percent(&mut self, percent: u8) -> Result<(), Error<BUS::Error>> {
+        if percent >= 100 {
+            return Err(Error::InvalidParam);
+        }
+        let sharpener = ((percent as u16 * 255) / 100) as u8;
+        self.dci_replace(DCI_SHARPENER, 16, &[sharpener], 0x0D)
+    }
+
+    /// Reads back the active sharpener percentage (0% to 99%).
+    ///
+    /// Corresponds to ST ULD `vl53l5cx_get_sharpener_percent`.
+    pub fn get_sharpener_percent(&mut self) -> Result<u8, Error<BUS::Error>> {
+        let mut b = [0u8; 16];
+        self.dci_read(DCI_SHARPENER, &mut b)?;
+        let percent = (b[0x0D] as u16 * 100 / 255) as u8;
+        Ok(percent)
+    }
+
+    /// Starts continuous ranging with 4x4 or 8x8 configuration.
     pub fn start_ranging(&mut self) -> Result<(), Error<BUS::Error>> {
         let mut zone = [0u8; 8];
         self.dci_read(DCI_ZONE_CONFIG, &mut zone)?;
         let resolution = u16::from(zone[0]) * u16::from(zone[1]);
-        if resolution as usize != codec::ZONES_4X4 {
+        if resolution as usize != codec::ZONES_4X4 && resolution as usize != codec::ZONES_8X8 {
             return Err(Error::UnsupportedResolution(resolution));
         }
 
@@ -797,7 +854,10 @@ impl<BUS: I2c, DELAY: DelayNs> Vl53l5cx<BUS, DELAY> {
             .map_err(Error::Bus)?;
 
         match codec::decode_data_ready(regs, self.streamcount) {
-            codec::ReadyState::Ready(_) => Ok(true),
+            codec::ReadyState::Ready(new_sc) => {
+                self.streamcount = new_sc;
+                Ok(true)
+            }
             codec::ReadyState::NotReady => Ok(false),
             codec::ReadyState::Abnormal(code) => Err(Error::Go2Status(code)),
         }
@@ -812,6 +872,19 @@ impl<BUS: I2c, DELAY: DelayNs> Vl53l5cx<BUS, DELAY> {
         self.read_temp(0x0000, n)?;
         let new_streamcount = self.temp[0];
         let frame = codec::parse_frame(&mut self.temp[..n]).map_err(Error::Frame)?;
+        self.streamcount = new_streamcount;
+        Ok(frame)
+    }
+
+    /// Reads and parses the current 8x8 ranging frame (64 zones).
+    pub fn get_ranging_data_8x8(&mut self) -> Result<Frame8x8, Error<BUS::Error>> {
+        let n = self.data_read_size;
+        if n == 0 {
+            return Err(Error::NotRanging);
+        }
+        self.read_temp(0x0000, n)?;
+        let new_streamcount = self.temp[0];
+        let frame = codec::parse_frame_8x8(&mut self.temp[..n]).map_err(Error::Frame)?;
         self.streamcount = new_streamcount;
         Ok(frame)
     }
@@ -963,6 +1036,7 @@ pub mod asynch {
         bus: BUS,
         addr: u8,
         temp: [u8; TEMP_SIZE],
+        offset_data: [u8; codec::OFFSET_BUFFER_SIZE],
         streamcount: u8,
         data_read_size: usize,
     }
@@ -974,6 +1048,7 @@ pub mod asynch {
                 bus,
                 addr,
                 temp: [0u8; TEMP_SIZE],
+                offset_data: [0u8; codec::OFFSET_BUFFER_SIZE],
                 streamcount: 255,
                 data_read_size: 0,
             }
@@ -1279,6 +1354,7 @@ pub mod asynch {
             self.poll_for_answer(4, 0, UI_CMD_STATUS, 0xFF, 0x02)
                 .await?;
             self.read_temp(UI_CMD_START, codec::NVM_DATA_SIZE).await?;
+            self.offset_data.copy_from_slice(&self.temp[..codec::OFFSET_BUFFER_SIZE]);
             codec::prepare_offset_4x4(&mut self.temp).map_err(|_| Error::InvalidParam)?;
             self.write_temp(0x2E18, codec::OFFSET_BUFFER_SIZE).await?;
             self.poll_for_answer(4, 1, UI_CMD_STATUS, 0xFF, 0x03)
@@ -1320,6 +1396,37 @@ pub mod asynch {
             zone[0x04] = 8;
             zone[0x05] = 8;
             self.dci_write(DCI_ZONE_CONFIG, &zone).await?;
+
+            Ok(())
+        }
+
+        /// Sets sensor resolution to 8x8 (64 zones).
+        pub async fn set_resolution_8x8(&mut self) -> Result<(), Error<BUS::Error>> {
+            let mut dss = [0u8; 16];
+            self.dci_read(DCI_DSS_CONFIG, &mut dss).await?;
+            dss[0x04] = 16;
+            dss[0x06] = 16;
+            dss[0x09] = 1;
+            self.dci_write(DCI_DSS_CONFIG, &dss).await?;
+
+            let mut zone = [0u8; 8];
+            self.dci_read(DCI_ZONE_CONFIG, &mut zone).await?;
+            zone[0x00] = 8;
+            zone[0x01] = 8;
+            zone[0x04] = 4;
+            zone[0x05] = 4;
+            self.dci_write(DCI_ZONE_CONFIG, &zone).await?;
+
+            // Send 8x8 offset calibration data per ST ULD lines 953 and 143-152
+            self.temp[..codec::OFFSET_BUFFER_SIZE].copy_from_slice(&self.offset_data);
+            codec::prepare_offset_8x8(&mut self.temp).map_err(|_| Error::InvalidParam)?;
+            self.write_temp(0x2E18, codec::OFFSET_BUFFER_SIZE).await?;
+            self.poll_for_answer(4, 1, UI_CMD_STATUS, 0xFF, 0x03).await?;
+
+            // Send 8x8 default Xtalk data per ST ULD lines 954 and 209-212
+            self.temp[..codec::XTALK_BUFFER_SIZE].copy_from_slice(DEFAULT_XTALK);
+            self.write_temp(0x2CF8, codec::XTALK_BUFFER_SIZE).await?;
+            self.poll_for_answer(4, 1, UI_CMD_STATUS, 0xFF, 0x03).await?;
 
             Ok(())
         }
@@ -1367,11 +1474,36 @@ pub mod asynch {
             }
         }
 
+        /// Sets the sharpener percentage (0% to 99%) to filter optical crosstalk and veiling glare.
+        ///
+        /// Corresponds to ST ULD `vl53l5cx_set_sharpener_percent`.
+        pub async fn set_sharpener_percent(
+            &mut self,
+            percent: u8,
+        ) -> Result<(), Error<BUS::Error>> {
+            if percent >= 100 {
+                return Err(Error::InvalidParam);
+            }
+            let sharpener = ((percent as u16 * 255) / 100) as u8;
+            self.dci_replace(DCI_SHARPENER, 16, &[sharpener], 0x0D)
+                .await
+        }
+
+        /// Reads back the active sharpener percentage (0% to 99%).
+        ///
+        /// Corresponds to ST ULD `vl53l5cx_get_sharpener_percent`.
+        pub async fn get_sharpener_percent(&mut self) -> Result<u8, Error<BUS::Error>> {
+            let mut b = [0u8; 16];
+            self.dci_read(DCI_SHARPENER, &mut b).await?;
+            let percent = (b[0x0D] as u16 * 100 / 255) as u8;
+            Ok(percent)
+        }
+
         pub async fn start_ranging(&mut self) -> Result<(), Error<BUS::Error>> {
             let mut zone = [0u8; 8];
             self.dci_read(DCI_ZONE_CONFIG, &mut zone).await?;
             let resolution = u16::from(zone[0]) * u16::from(zone[1]);
-            if resolution as usize != codec::ZONES_4X4 {
+            if resolution as usize != codec::ZONES_4X4 && resolution as usize != codec::ZONES_8X8 {
                 return Err(Error::UnsupportedResolution(resolution));
             }
 
@@ -1474,7 +1606,10 @@ pub mod asynch {
                 .map_err(Error::Bus)?;
 
             match codec::decode_data_ready(regs, self.streamcount) {
-                codec::ReadyState::Ready(_) => Ok(true),
+                codec::ReadyState::Ready(new_sc) => {
+                    self.streamcount = new_sc;
+                    Ok(true)
+                }
                 codec::ReadyState::NotReady => Ok(false),
                 codec::ReadyState::Abnormal(code) => Err(Error::Go2Status(code)),
             }
@@ -1488,6 +1623,19 @@ pub mod asynch {
             self.read_temp(0x0000, n).await?;
             let new_streamcount = self.temp[0];
             let frame = codec::parse_frame(&mut self.temp[..n]).map_err(Error::Frame)?;
+            self.streamcount = new_streamcount;
+            Ok(frame)
+        }
+
+        /// Reads and parses the current 8x8 ranging frame (64 zones).
+        pub async fn get_ranging_data_8x8(&mut self) -> Result<Frame8x8, Error<BUS::Error>> {
+            let n = self.data_read_size;
+            if n == 0 {
+                return Err(Error::NotRanging);
+            }
+            self.read_temp(0x0000, n).await?;
+            let new_streamcount = self.temp[0];
+            let frame = codec::parse_frame_8x8(&mut self.temp[..n]).map_err(Error::Frame)?;
             self.streamcount = new_streamcount;
             Ok(frame)
         }
@@ -1605,5 +1753,21 @@ mod tests {
         assert_eq!(TargetOrder::Closest as u8, 1);
         assert_eq!(TargetOrder::Strongest as u8, 2);
         assert_eq!(DCI_TARGET_ORDER, 0xAE64);
+    }
+
+    #[test]
+    fn test_sharpener_dci_and_scaling() {
+        assert_eq!(DCI_SHARPENER, 0xAED8);
+        // 0% -> 0
+        let s0 = ((0u16 * 255) / 100) as u8;
+        assert_eq!(s0, 0);
+        // 35% -> 89 (89 * 100 / 255 = 34%)
+        let s35 = ((35u16 * 255) / 100) as u8;
+        assert_eq!(s35, 89);
+        let roundtrip = (s35 as u16 * 100 / 255) as u8;
+        assert_eq!(roundtrip, 34); // integer division truncation
+                                   // 99% -> 252
+        let s99 = ((99u16 * 255) / 100) as u8;
+        assert_eq!(s99, 252);
     }
 }
