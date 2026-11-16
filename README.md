@@ -183,7 +183,7 @@ The VL53L5CX operates at 3.3V I/O logic levels (requires 2.8V / 3.3V analog supp
 | :--- | :--- | :--- |
 | **VIN** | 3.3V | Power supply (2.8V–3.3V) |
 | **GND** | GND | Common ground |
-| **SCL** | I2C SCL | Pull-up to 3.3V (2.2 k$\Omega$ recommended for 1 MHz Fast-Mode Plus) |
+| **SCL** | I2C SCL | Pull-up to 3.3V (2.2 kΩ recommended for 1 MHz Fast-Mode Plus) |
 | **SDA** | I2C SDA | Pull-up to 3.3V |
 | **LPn** | GPIO Out | Active-low reset (pull high for operational mode) |
 | **PWR_EN** | GPIO Out | Power enable for internal 1.8V LDO |
