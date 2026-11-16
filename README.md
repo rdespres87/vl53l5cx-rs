@@ -23,10 +23,21 @@ A pure `#![no_std]` Rust driver for the **STMicroelectronics VL53L5CX** 8×8 mul
 
 ## Features
 
-- **4×4 Multizone Spatial Ranging:** 16 discrete zones providing multi-target depth detection.
-- **Per-Zone Telemetry (`Frame4x4`):** Target status (5 = Valid target, 6 = Phase wrap valid, 9 = Low signal valid, 255 = No target), distance in millimeters (`distance_mm`), number of targets detected (`nb_target_detected`), and silicon temperature in °C (`silicon_temp_degc`).
-- **Autonomous Ranging:** Continuous ranging up to 60 Hz.
-- **Factory Calibration & Crosstalk:** Embedded default configuration, crosstalk compensation, and NVM compensation tables.
+- **Dual-Resolution Multizone Ranging:**
+  - **4×4 Mode (16 discrete zones):** High-speed ranging up to 60 Hz, ideal for gesture recognition, proximity sensing, and low-latency tracking.
+  - **8×8 Mode (64 discrete zones):** High-resolution spatial depth mapping up to 15 Hz, ideal for 2D scene analysis and robotics obstacle detection.
+- **Rich Per-Zone Telemetry (`Frame4x4` & `Frame8x8`):**
+  - Millimeter-accurate distance per zone (`distance_mm`).
+  - Target qualification status (`target_status`): `5` (Valid target), `6` (Phase wrap valid), `9` (Low signal valid), `255` (No target).
+  - Target count per zone (`nb_target_detected`).
+  - Internal silicon temperature in °C (`silicon_temp_degc`).
+- **Flexible Sensor Configuration:**
+  - **Resolution:** Seamlessly switch between `set_resolution_4x4()` and `set_resolution_8x8()`.
+  - **Ranging Frequency:** Dynamic adjustment via `set_ranging_frequency_hz()` (1–60 Hz in 4×4, 1–15 Hz in 8×8).
+  - **Target Selection:** Configure `set_target_order()` to prioritize either `TargetOrder::Closest` or `TargetOrder::Strongest`.
+  - **Motion Blur / Sharpener Filter:** Adjust edge contrast with `set_sharpener_percent(0..=99)`.
+  - **Dynamic I2C Readdressing:** Reconfigure sensor I2C address via `set_i2c_address()` to chain multiple VL53L5CX sensors on a single bus using LPn reset pins.
+- **Factory Calibration & Crosstalk:** Embedded default configuration, optical crosstalk compensation, and NVM compensation tables.
 
 ---
 
@@ -99,7 +110,29 @@ where
 }
 ```
 
-### 2. Async API (`embedded-hal-async` 1.0 + Embassy)
+### 2. High-Resolution 8×8 Ranging (64 Zones)
+
+```rust,no_run
+// Configure 8x8 resolution (64 zones) and 15 Hz ranging
+sensor.set_resolution_8x8()?;
+sensor.set_ranging_frequency_hz(15)?;
+sensor.start_ranging()?;
+
+loop {
+    if sensor.check_data_ready()? {
+        let frame = sensor.get_ranging_data_8x8()?;
+        // Access 64 depth zones (0..64)
+        for (zone_idx, &dist_mm) in frame.distance_mm.iter().enumerate() {
+            let status = frame.target_status[zone_idx];
+            if status == 5 || status == 6 || status == 9 {
+                // Zone zone_idx has a valid target at dist_mm
+            }
+        }
+    }
+}
+```
+
+### 3. Async API (`embedded-hal-async` 1.0 + Embassy)
 
 ```rust,no_run
 #![no_std]

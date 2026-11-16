@@ -285,6 +285,7 @@ pub struct Vl53l5cx<BUS, DELAY> {
     delay: DELAY,
     addr: u8,
     temp: [u8; TEMP_SIZE],
+    #[allow(dead_code)]
     offset_data: [u8; codec::OFFSET_BUFFER_SIZE],
     streamcount: u8,
     data_read_size: usize,
@@ -610,7 +611,8 @@ impl<BUS: I2c, DELAY: DelayNs> Vl53l5cx<BUS, DELAY> {
         self.write_slice(0x2FD8, GET_NVM_CMD)?;
         self.poll_for_answer(4, 0, UI_CMD_STATUS, 0xFF, 0x02)?;
         self.read_temp(UI_CMD_START, codec::NVM_DATA_SIZE)?;
-        self.offset_data.copy_from_slice(&self.temp[..codec::OFFSET_BUFFER_SIZE]);
+        self.offset_data
+            .copy_from_slice(&self.temp[..codec::OFFSET_BUFFER_SIZE]);
         codec::prepare_offset_4x4(&mut self.temp).map_err(|_| Error::InvalidParam)?;
         self.write_temp(0x2E18, codec::OFFSET_BUFFER_SIZE)?;
         self.poll_for_answer(4, 1, UI_CMD_STATUS, 0xFF, 0x03)?;
@@ -656,6 +658,7 @@ impl<BUS: I2c, DELAY: DelayNs> Vl53l5cx<BUS, DELAY> {
     }
 
     /// Sets sensor resolution to 8x8 (64 zones).
+    #[cfg(feature = "firmware-blob")]
     pub fn set_resolution_8x8(&mut self) -> Result<(), Error<BUS::Error>> {
         let mut dss = [0u8; 16];
         self.dci_read(DCI_DSS_CONFIG, &mut dss)?;
@@ -1036,6 +1039,7 @@ pub mod asynch {
         bus: BUS,
         addr: u8,
         temp: [u8; TEMP_SIZE],
+        #[allow(dead_code)]
         offset_data: [u8; codec::OFFSET_BUFFER_SIZE],
         streamcount: u8,
         data_read_size: usize,
@@ -1354,7 +1358,8 @@ pub mod asynch {
             self.poll_for_answer(4, 0, UI_CMD_STATUS, 0xFF, 0x02)
                 .await?;
             self.read_temp(UI_CMD_START, codec::NVM_DATA_SIZE).await?;
-            self.offset_data.copy_from_slice(&self.temp[..codec::OFFSET_BUFFER_SIZE]);
+            self.offset_data
+                .copy_from_slice(&self.temp[..codec::OFFSET_BUFFER_SIZE]);
             codec::prepare_offset_4x4(&mut self.temp).map_err(|_| Error::InvalidParam)?;
             self.write_temp(0x2E18, codec::OFFSET_BUFFER_SIZE).await?;
             self.poll_for_answer(4, 1, UI_CMD_STATUS, 0xFF, 0x03)
@@ -1401,6 +1406,7 @@ pub mod asynch {
         }
 
         /// Sets sensor resolution to 8x8 (64 zones).
+        #[cfg(feature = "firmware-blob")]
         pub async fn set_resolution_8x8(&mut self) -> Result<(), Error<BUS::Error>> {
             let mut dss = [0u8; 16];
             self.dci_read(DCI_DSS_CONFIG, &mut dss).await?;
@@ -1421,12 +1427,14 @@ pub mod asynch {
             self.temp[..codec::OFFSET_BUFFER_SIZE].copy_from_slice(&self.offset_data);
             codec::prepare_offset_8x8(&mut self.temp).map_err(|_| Error::InvalidParam)?;
             self.write_temp(0x2E18, codec::OFFSET_BUFFER_SIZE).await?;
-            self.poll_for_answer(4, 1, UI_CMD_STATUS, 0xFF, 0x03).await?;
+            self.poll_for_answer(4, 1, UI_CMD_STATUS, 0xFF, 0x03)
+                .await?;
 
             // Send 8x8 default Xtalk data per ST ULD lines 954 and 209-212
             self.temp[..codec::XTALK_BUFFER_SIZE].copy_from_slice(DEFAULT_XTALK);
             self.write_temp(0x2CF8, codec::XTALK_BUFFER_SIZE).await?;
-            self.poll_for_answer(4, 1, UI_CMD_STATUS, 0xFF, 0x03).await?;
+            self.poll_for_answer(4, 1, UI_CMD_STATUS, 0xFF, 0x03)
+                .await?;
 
             Ok(())
         }
@@ -1759,6 +1767,7 @@ mod tests {
     fn test_sharpener_dci_and_scaling() {
         assert_eq!(DCI_SHARPENER, 0xAED8);
         // 0% -> 0
+        #[allow(clippy::erasing_op)]
         let s0 = ((0u16 * 255) / 100) as u8;
         assert_eq!(s0, 0);
         // 35% -> 89 (89 * 100 / 255 = 34%)
