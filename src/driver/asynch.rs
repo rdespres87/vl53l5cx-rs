@@ -1,5 +1,5 @@
 use embassy_time::Timer;
-use embedded_hal_async::i2c::{I2c as AsyncI2c, Operation as AsyncOperation};
+use embedded_hal_async::i2c::I2c as AsyncI2c;
 
 use crate::codec::{self, Frame4x4, Frame8x8};
 use crate::{
@@ -46,31 +46,42 @@ pub async fn probe<B: AsyncI2c>(bus: &mut B, addr: u8) -> Result<(u8, u8), B::Er
     Ok((id[0], id[1]))
 }
 
-async fn write_multi_async<B: AsyncI2c>(
+/// Writes multi-byte payloads using contiguous `[reg_hi, reg_lo, chunk...]` frames
+/// chunked to 256 bytes, adhering to the ST ULD `VL53L5CX_WrMulti` specification.
+/// Contiguous frames guarantee standard I2C bus compatibility across all MCU architectures.
+pub(crate) async fn write_multi_async<B: AsyncI2c>(
     bus: &mut B,
     addr: u8,
-    reg: u16,
-    data: &[u8],
+    mut reg: u16,
+    mut data: &[u8],
 ) -> Result<(), B::Error> {
-    let reg_bytes = reg.to_be_bytes();
-    let mut last_err = None;
-    for attempt in 0..5 {
-        let mut ops = [
-            AsyncOperation::Write(&reg_bytes),
-            AsyncOperation::Write(data),
-        ];
-        match bus.transaction(addr, &mut ops).await {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                last_err = Some(e);
-                Timer::after_millis(10 * (attempt + 1) as u64).await;
+    const CHUNK_SIZE: usize = 256;
+    let mut chunk_buf = [0u8; 2 + CHUNK_SIZE];
+    while !data.is_empty() {
+        let chunk_len = data.len().min(CHUNK_SIZE);
+        chunk_buf[0..2].copy_from_slice(&reg.to_be_bytes());
+        chunk_buf[2..2 + chunk_len].copy_from_slice(&data[..chunk_len]);
+
+        let mut last_err = None;
+        for attempt in 0..5 {
+            match bus.write(addr, &chunk_buf[..2 + chunk_len]).await {
+                Ok(()) => {
+                    last_err = None;
+                    break;
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    Timer::after_millis(10 * (attempt + 1) as u64).await;
+                }
             }
         }
+        if let Some(err) = last_err {
+            return Err(err);
+        }
+        reg = reg.wrapping_add(chunk_len as u16);
+        data = &data[chunk_len..];
     }
-    match last_err {
-        Some(err) => Err(err),
-        None => Ok(()),
-    }
+    Ok(())
 }
 
 async fn read_multi_async<B: AsyncI2c>(
@@ -122,27 +133,9 @@ async fn write_fw_bank_async<B: AsyncI2c>(
 
     Timer::after_millis(10).await;
 
-    let reg_bytes = [0x00, 0x00];
-    let mut ops = [
-        AsyncOperation::Write(&reg_bytes),
-        AsyncOperation::Write(data),
-    ];
-    let mut bank_err = None;
-    for attempt in 0..5 {
-        match bus.transaction(addr, &mut ops).await {
-            Ok(()) => {
-                bank_err = None;
-                break;
-            }
-            Err(e) => {
-                bank_err = Some(e);
-                Timer::after_millis(20 * (attempt + 1) as u64).await;
-            }
-        }
-    }
-    if let Some(err) = bank_err {
-        return Err(Error::Bus(err));
-    }
+    write_multi_async(bus, addr, 0x0000, data)
+        .await
+        .map_err(Error::Bus)?;
 
     Timer::after_millis(50).await;
     Ok(())

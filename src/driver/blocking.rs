@@ -1,5 +1,5 @@
 use embedded_hal::delay::DelayNs;
-use embedded_hal::i2c::{I2c, Operation};
+use embedded_hal::i2c::I2c;
 
 use crate::codec::{self, Frame4x4, Frame8x8};
 use crate::{
@@ -51,29 +51,43 @@ pub fn probe<B: I2c, D: DelayNs>(
     Ok((id[0], id[1]))
 }
 
-fn write_multi_blocking<B: I2c, D: DelayNs>(
+/// Writes multi-byte payloads using contiguous `[reg_hi, reg_lo, chunk...]` frames
+/// chunked to 256 bytes, adhering to the ST ULD `VL53L5CX_WrMulti` specification.
+/// Contiguous frames guarantee standard I2C bus compatibility across all MCU architectures.
+pub(crate) fn write_multi_blocking<B: I2c, D: DelayNs>(
     bus: &mut B,
     delay: &mut D,
     addr: u8,
-    reg: u16,
-    data: &[u8],
+    mut reg: u16,
+    mut data: &[u8],
 ) -> Result<(), B::Error> {
-    let reg_bytes = reg.to_be_bytes();
-    let mut last_err = None;
-    for attempt in 0..5 {
-        let mut ops = [Operation::Write(&reg_bytes), Operation::Write(data)];
-        match bus.transaction(addr, &mut ops) {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                last_err = Some(e);
-                delay.delay_ms(10 * (attempt + 1));
+    const CHUNK_SIZE: usize = 256;
+    let mut chunk_buf = [0u8; 2 + CHUNK_SIZE];
+    while !data.is_empty() {
+        let chunk_len = data.len().min(CHUNK_SIZE);
+        chunk_buf[0..2].copy_from_slice(&reg.to_be_bytes());
+        chunk_buf[2..2 + chunk_len].copy_from_slice(&data[..chunk_len]);
+
+        let mut last_err = None;
+        for attempt in 0..5 {
+            match bus.write(addr, &chunk_buf[..2 + chunk_len]) {
+                Ok(()) => {
+                    last_err = None;
+                    break;
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    delay.delay_ms(10 * (attempt + 1));
+                }
             }
         }
+        if let Some(err) = last_err {
+            return Err(err);
+        }
+        reg = reg.wrapping_add(chunk_len as u16);
+        data = &data[chunk_len..];
     }
-    match last_err {
-        Some(err) => Err(err),
-        None => Ok(()),
-    }
+    Ok(())
 }
 
 fn read_multi_blocking<B: I2c, D: DelayNs>(
@@ -127,24 +141,7 @@ fn write_fw_bank_blocking<B: I2c, D: DelayNs>(
 
     delay.delay_ms(10);
 
-    let reg_bytes = [0x00, 0x00];
-    let mut ops = [Operation::Write(&reg_bytes), Operation::Write(data)];
-    let mut bank_err = None;
-    for attempt in 0..5 {
-        match bus.transaction(addr, &mut ops) {
-            Ok(()) => {
-                bank_err = None;
-                break;
-            }
-            Err(e) => {
-                bank_err = Some(e);
-                delay.delay_ms(20 * (attempt + 1));
-            }
-        }
-    }
-    if let Some(err) = bank_err {
-        return Err(Error::Bus(err));
-    }
+    write_multi_blocking(bus, delay, addr, 0x0000, data).map_err(Error::Bus)?;
 
     delay.delay_ms(50);
     Ok(())

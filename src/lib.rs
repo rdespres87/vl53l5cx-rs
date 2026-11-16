@@ -628,6 +628,60 @@ mod tests {
         assert_eq!(sensor.data_read_size, 0);
     }
 
+    struct RecordingBus {
+        writes: Vec<Vec<u8>>,
+    }
+    impl embedded_hal::i2c::ErrorType for RecordingBus {
+        type Error = CustomBusError;
+    }
+    impl I2c for RecordingBus {
+        fn read(&mut self, _address: u8, _read: &mut [u8]) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn write(&mut self, _address: u8, write: &[u8]) -> Result<(), Self::Error> {
+            self.writes.push(write.to_vec());
+            Ok(())
+        }
+        fn write_read(
+            &mut self,
+            _address: u8,
+            _write: &[u8],
+            _read: &mut [u8],
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn transaction(
+            &mut self,
+            _address: u8,
+            _operations: &mut [Operation<'_>],
+        ) -> Result<(), Self::Error> {
+            panic!("transaction() is not used: multi-byte writes use contiguous write() frames per ST ULD specification");
+        }
+    }
+
+    #[test]
+    fn test_write_multi_chunking_and_address_increment() {
+        let mut bus = RecordingBus { writes: Vec::new() };
+        let payload = [0xAAu8; 600];
+        let res = driver::blocking::write_multi_blocking(
+            &mut bus,
+            &mut MockDelay,
+            DEFAULT_ADDR,
+            0x1000,
+            &payload,
+        );
+        assert!(res.is_ok());
+        assert_eq!(bus.writes.len(), 3);
+        // Chunk 0: 256 bytes payload + 2 bytes addr (0x1000)
+        assert_eq!(bus.writes[0].len(), 258);
+        assert_eq!(bus.writes[0][0..2], [0x10, 0x00]);
+        // Chunk 1: 256 bytes payload + 2 bytes addr (0x1000 + 256 = 0x1100)
+        assert_eq!(bus.writes[1].len(), 258);
+        assert_eq!(bus.writes[1][0..2], [0x11, 0x00]);
+        // Chunk 2: remaining 88 bytes payload + 2 bytes addr (0x1100 + 256 = 0x1200)
+        assert_eq!(bus.writes[2].len(), 90);
+        assert_eq!(bus.writes[2][0..2], [0x12, 0x00]);
+    }
 
     #[cfg(feature = "defmt")]
     #[test]
