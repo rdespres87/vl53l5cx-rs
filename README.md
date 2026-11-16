@@ -173,6 +173,42 @@ async fn tof_task(i2c: impl I2c) {
 }
 ```
 
+### 4. Interrupt-Driven Ranging (Hardware INT Pin)
+
+By default, the driver decouples I2C communication from GPIO interrupt handling. This gives you full flexibility over your board's power modes, EXTI interrupt lines, or RTIC / Embassy async tasks without borrow-checker conflicts over pin ownership.
+
+The VL53L5CX hardware automatically emits an **active-low pulse (~100 µs)** on the `INT` pin as soon as a new frame is ready. It clears automatically with no manual I2C clear command required.
+
+```rust,no_run
+use embassy_nrf::gpio::Input; // Or any embedded-hal-async Wait pin
+use embedded_hal_async::i2c::I2c;
+use vl53l5cx::asynch::Vl53l5cx;
+use vl53l5cx::DEFAULT_ADDR;
+
+#[embassy_executor::task]
+async fn tof_interrupt_task(i2c: impl I2c, mut int_pin: Input<'static>) {
+    let mut sensor = Vl53l5cx::new(i2c, DEFAULT_ADDR);
+    if sensor.init().await.is_err() || sensor.start_ranging().await.is_err() {
+        return;
+    }
+
+    loop {
+        // Sleep (WFI) until the sensor pulses the INT line low (~100 µs falling edge)
+        int_pin.wait_for_falling_edge().await;
+
+        // Fetch ranging data immediately without polling the I2C bus
+        if let Ok(frame) = sensor.get_ranging_data().await {
+            let center_distance = frame.distance_mm[10];
+            // Process frame...
+        }
+    }
+}
+```
+
+> [!TIP]
+> - **Falling-Edge Trigger:** Because the active-low pulse duration is ~100 µs, configure your MCU's external interrupt line for **falling edge** (`FALLING`), not low level.
+> - **Pull-Up:** The `INT` pin is open-drain: ensure internal or external pull-up to 3.3V is enabled.
+
 ---
 
 ## Hardware Connection
