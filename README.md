@@ -2,7 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/vl53l5cx.svg)](https://crates.io/crates/vl53l5cx)
 [![Docs.rs](https://docs.rs/vl53l5cx/badge.svg)](https://docs.rs/vl53l5cx)
-[![CI](https://github.com/rdespres/vl53l5cx-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/rdespres/vl53l5cx-rs/actions)
+[![CI](https://github.com/rdespres87/vl53l5cx-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/rdespres87/vl53l5cx-rs/actions)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 [![no_std](https://img.shields.io/badge/no__std-compatible-success.svg)](https://github.com/rust-embedded)
 
