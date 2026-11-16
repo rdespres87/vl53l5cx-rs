@@ -30,6 +30,14 @@ pub const DISTANCE_IDX: u16 = 0xDF44;
 /// Block-header index of the per-zone target status block (`VL53L5CX_NB_TARGET_PER_ZONE == 1`).
 pub const TARGET_STATUS_IDX: u16 = 0xE084;
 
+/// DCI index for zone config (4x4 vs 8x8 resolution).
+pub const DCI_ZONE_CONFIG: u16 = 0x5450;
+/// DCI index for ranging mode (continuous vs autonomous).
+pub const DCI_RANGING_MODE: u16 = 0xAD30;
+/// DCI index for dynamic spad selection (DSS) config.
+pub const DCI_DSS_CONFIG: u16 = 0xAD38;
+/// DCI index for ranging frequency in Hz.
+pub const DCI_FREQ_HZ: u16 = 0x5458;
 /// DCI index to set single range mode (1 = enabled per ST ULD).
 pub const DCI_SINGLE_RANGE: u16 = 0xD964;
 /// DCI index to configure output buffer size and entries count (`VL53L5CX_DCI_OUTPUT_CONFIG_IDX`).
@@ -40,6 +48,10 @@ pub const DCI_OUTPUT_ENABLES: u16 = 0xD970;
 pub const DCI_OUTPUT_LIST: u16 = 0xD980;
 /// DCI index for pipe control / target per zone (`VL53L5CX_DCI_PIPE_CONTROL_IDX`).
 pub const DCI_PIPE_CONTROL: u16 = 0xDB80;
+/// DCI index for glare filter threshold.
+pub const DCI_GLARE_FILTER: u16 = 0xE108;
+/// DCI index for UI range data output configuration.
+pub const DCI_UI_RANGE_DATA: u16 = 0x5440;
 /// DCI index for target ordering (`VL53L5CX_DCI_TARGET_ORDER`).
 pub const DCI_TARGET_ORDER: u16 = 0xAE64;
 /// DCI index for sharpener percent (`VL53L5CX_DCI_SHARPENER`).
@@ -82,6 +94,7 @@ pub const OUTPUT_LIST: [u32; 12] = [
 pub const OUTPUT_ENABLES: [u32; 4] = [0x0000_0527, 0x0000_0000, 0x0000_0000, 0xC000_0000];
 
 /// Converts a buffer between sensor (big-endian words) and host order, in place.
+#[allow(clippy::chunks_exact_to_as_chunks)]
 pub fn swap_words(buf: &mut [u8]) {
     for word in buf.chunks_exact_mut(4) {
         word.reverse();
@@ -97,43 +110,54 @@ fn read_u32_le(buf: &[u8], offset: usize) -> u32 {
     ])
 }
 
-/// Averages each 2x2 block of an 8x8 grid into the first 16 cells (4x4),
-/// then zeroes the remaining 48 cells. Mirrors the ULD extrapolation loops.
-fn downsample_u32_8x8_to_4x4(grid: &mut [u32; 64]) {
-    for j in 0..4 {
-        for i in 0..4 {
-            let base = 2 * i + 16 * j;
-            let sum = grid[base]
-                .wrapping_add(grid[base + 1])
-                .wrapping_add(grid[base + 8])
-                .wrapping_add(grid[base + 9]);
-            grid[i + 4 * j] = sum / 4;
-        }
-    }
-    for cell in grid.iter_mut().skip(ZONES_4X4) {
-        *cell = 0;
+/// Trait for element types that can be downsampled via 2x2 spatial block averaging.
+pub trait DownsampleElement: Copy + Default {
+    fn average_2x2(a: Self, b: Self, c: Self, d: Self) -> Self;
+}
+
+impl DownsampleElement for u32 {
+    #[inline]
+    fn average_2x2(a: Self, b: Self, c: Self, d: Self) -> Self {
+        a.wrapping_add(b).wrapping_add(c).wrapping_add(d) / 4
     }
 }
 
-fn downsample_i16_8x8_to_4x4(grid: &mut [i16; 64]) {
+impl DownsampleElement for i16 {
+    #[inline]
+    fn average_2x2(a: Self, b: Self, c: Self, d: Self) -> Self {
+        let sum = i32::from(a) + i32::from(b) + i32::from(c) + i32::from(d);
+        (sum / 4) as i16
+    }
+}
+
+/// Averages each 2x2 block of an 8x8 grid into the first 16 cells (4x4),
+/// then zeroes the remaining 48 cells. Mirrors the ULD extrapolation loops.
+fn downsample_8x8_to_4x4<T: DownsampleElement>(grid: &mut [T; 64]) {
     for j in 0..4 {
         for i in 0..4 {
             let base = 2 * i + 16 * j;
-            let sum = i32::from(grid[base])
-                + i32::from(grid[base + 1])
-                + i32::from(grid[base + 8])
-                + i32::from(grid[base + 9]);
-            // C integer division truncates toward zero, as does Rust's.
-            grid[i + 4 * j] = (sum / 4) as i16;
+            grid[i + 4 * j] =
+                T::average_2x2(grid[base], grid[base + 1], grid[base + 8], grid[base + 9]);
         }
     }
     for cell in grid.iter_mut().skip(ZONES_4X4) {
-        *cell = 0;
+        *cell = T::default();
     }
+}
+
+#[inline]
+fn downsample_u32_8x8_to_4x4(grid: &mut [u32; 64]) {
+    downsample_8x8_to_4x4(grid);
+}
+
+#[inline]
+fn downsample_i16_8x8_to_4x4(grid: &mut [i16; 64]) {
+    downsample_8x8_to_4x4(grid);
 }
 
 /// Error returned by the in-place buffer transforms when the buffer is too small.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct BufferTooSmall {
     pub needed: usize,
     pub actual: usize,
@@ -247,7 +271,7 @@ pub fn prepare_xtalk_4x4(buf: &mut [u8]) -> Result<(), BufferTooSmall> {
 
 /// Builds the 12-byte DCI read request (`vl53l5cx_dci_read_data`).
 /// Must be written at `UI_CMD_END - 11` (= `0x2FF4`).
-pub fn dci_read_cmd(index: u16, size: u16) -> [u8; 12] {
+pub const fn dci_read_cmd(index: u16, size: u16) -> [u8; 12] {
     let [idx_hi, idx_lo] = index.to_be_bytes();
     [
         idx_hi,
@@ -296,6 +320,7 @@ pub fn dci_write_frame(index: u16, data: &[u8], out: &mut [u8]) -> Option<(u16, 
 
 /// Result of one poll iteration (`_vl53l5cx_poll_for_answer`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum PollOutcome {
     Done,
     Pending,
@@ -316,6 +341,7 @@ pub fn poll_outcome(buf: &[u8], pos: usize, mask: u8, expected: u8) -> PollOutco
 
 /// Output configuration derived from [`OUTPUT_LIST`] / [`OUTPUT_ENABLES`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct OutputConfig {
     /// Block headers with size fields patched for the active resolution.
     pub list: [u32; 12],
@@ -396,6 +422,7 @@ pub fn build_output_config(resolution: u16) -> OutputConfig {
 
 /// Serializes `u32` words in host (little-endian) layout, as the ULD passes
 /// them to `vl53l5cx_dci_write_data`.
+#[allow(clippy::chunks_exact_to_as_chunks)]
 pub fn words_to_le<const W: usize, const B: usize>(words: &[u32; W]) -> [u8; B] {
     let mut out = [0u8; B];
     for (chunk, word) in out.chunks_exact_mut(4).zip(words.iter()) {
@@ -406,6 +433,7 @@ pub fn words_to_le<const W: usize, const B: usize>(words: &[u32; W]) -> [u8; B] 
 
 /// Decoded state of the 4 status bytes at register `0x0000`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum ReadyState {
     /// A new frame is available; carries the new stream count.
     Ready(u8),
@@ -440,41 +468,38 @@ pub fn decode_data_ready(regs: [u8; 4], last_streamcount: u8) -> ReadyState {
     }
 }
 
-/// One decoded 4x4 ranging frame.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct Frame4x4 {
-    pub silicon_temp_degc: i8,
-    /// Distance per zone in millimetres (negative values clamped to 0).
-    pub distance_mm: [i16; ZONES_4X4],
-    /// ST target status per zone (5 and 9 = valid; 255 = no target).
-    pub target_status: [u8; ZONES_4X4],
-    pub nb_target_detected: [u8; ZONES_4X4],
-}
-
-/// One decoded 8x8 ranging frame (64 zones).
+/// One decoded ranging frame of arbitrary zone count (typically 16 for 4x4 or 64 for 8x8).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Frame8x8 {
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct GenericFrame<const Z: usize> {
     pub silicon_temp_degc: i8,
     /// Distance per zone in millimetres (negative values clamped to 0).
-    pub distance_mm: [i16; ZONES_8X8],
+    pub distance_mm: [i16; Z],
     /// ST target status per zone (5 and 9 = valid; 255 = no target).
-    pub target_status: [u8; ZONES_8X8],
-    pub nb_target_detected: [u8; ZONES_8X8],
+    pub target_status: [u8; Z],
+    pub nb_target_detected: [u8; Z],
 }
 
-impl Default for Frame8x8 {
+impl<const Z: usize> Default for GenericFrame<Z> {
     fn default() -> Self {
         Self {
             silicon_temp_degc: 0,
-            distance_mm: [0; ZONES_8X8],
-            target_status: [255; ZONES_8X8],
-            nb_target_detected: [0; ZONES_8X8],
+            distance_mm: [0; Z],
+            target_status: [255; Z],
+            nb_target_detected: [0; Z],
         }
     }
 }
 
+/// One decoded 4x4 ranging frame (16 zones).
+pub type Frame4x4 = GenericFrame<ZONES_4X4>;
+
+/// One decoded 8x8 ranging frame (64 zones).
+pub type Frame8x8 = GenericFrame<ZONES_8X8>;
+
 /// Frame decoding failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum FrameError {
     TooShort(usize),
     /// A block header announced more data than the frame contains.
@@ -489,16 +514,20 @@ pub enum FrameError {
     },
 }
 
-/// Port of `vl53l5cx_get_ranging_data` for 4x4 / 1 target per zone.
+/// Internal generic frame parser shared by 4x4 and 8x8 modes.
 /// `buf` is the raw frame read from register `0x0000`; it is swapped in place.
-pub fn parse_frame(buf: &mut [u8]) -> Result<Frame4x4, FrameError> {
+#[allow(clippy::chunks_exact_to_as_chunks)]
+pub fn parse_frame_inner<const Z: usize>(
+    buf: &mut [u8],
+    check_footer: bool,
+) -> Result<GenericFrame<Z>, FrameError> {
     let len = buf.len();
     if len < 24 || !len.is_multiple_of(4) {
         return Err(FrameError::TooShort(len));
     }
     swap_words(buf);
 
-    let mut frame = Frame4x4::default();
+    let mut frame = GenericFrame::<Z>::default();
     let mut i = 16;
     while i + 4 <= len {
         let bh = read_u32_le(buf, i);
@@ -535,7 +564,7 @@ pub fn parse_frame(buf: &mut [u8]) -> Result<Frame4x4, FrameError> {
                 }
             }
             NB_TARGET_DETECTED_IDX => {
-                let n = data.len().min(ZONES_4X4);
+                let n = data.len().min(Z);
                 frame.nb_target_detected[..n].copy_from_slice(&data[..n]);
             }
             DISTANCE_IDX => {
@@ -544,7 +573,7 @@ pub fn parse_frame(buf: &mut [u8]) -> Result<Frame4x4, FrameError> {
                 }
             }
             TARGET_STATUS_IDX => {
-                let n = data.len().min(ZONES_4X4);
+                let n = data.len().min(Z);
                 frame.target_status[..n].copy_from_slice(&data[..n]);
             }
             _ => {}
@@ -570,101 +599,38 @@ pub fn parse_frame(buf: &mut [u8]) -> Result<Frame4x4, FrameError> {
         }
     }
 
-    let header_id = u16::from_be_bytes([buf[0x8], buf[0x9]]);
-    let footer_id = u16::from_be_bytes([buf[len - 4], buf[len - 3]]);
-    if header_id != footer_id {
-        return Err(FrameError::Corrupted {
-            header_id,
-            footer_id,
-        });
+    if check_footer {
+        let header_id = u16::from_be_bytes([buf[0x8], buf[0x9]]);
+        let footer_id = u16::from_be_bytes([buf[len - 4], buf[len - 3]]);
+        if header_id != footer_id {
+            return Err(FrameError::Corrupted {
+                header_id,
+                footer_id,
+            });
+        }
+    } else {
+        // In ST ULD, if header_id != footer_id it sets VL53L5CX_STATUS_CORRUPTED_FRAME
+        // advisory bit but does not discard the parsed ranging results.
+        // In 8x8 mode with minimal enables, footer_id is placed by microcode
+        // at a separate circular boundary, so we do not abort.
+        let _ = (buf[0x8], buf[len - 4]);
     }
+
     Ok(frame)
+}
+
+/// Port of `vl53l5cx_get_ranging_data` for 4x4 / 1 target per zone.
+/// `buf` is the raw frame read from register `0x0000`; it is swapped in place.
+#[inline]
+pub fn parse_frame(buf: &mut [u8]) -> Result<Frame4x4, FrameError> {
+    parse_frame_inner::<ZONES_4X4>(buf, true)
 }
 
 /// Port of `vl53l5cx_get_ranging_data` for 8x8 / 1 target per zone (64 zones).
 /// `buf` is the raw frame read from register `0x0000`; it is swapped in place.
+#[inline]
 pub fn parse_frame_8x8(buf: &mut [u8]) -> Result<Frame8x8, FrameError> {
-    let len = buf.len();
-    if len < 24 || !len.is_multiple_of(4) {
-        return Err(FrameError::TooShort(len));
-    }
-    swap_words(buf);
-
-    let mut frame = Frame8x8::default();
-    let mut i = 16;
-    while i + 4 <= len {
-        let bh = read_u32_le(buf, i);
-        let bh_type = (bh & 0xF) as usize;
-        let size = ((bh >> 4) & 0x0FFF) as usize;
-        let idx = (bh >> 16) as u16;
-        let msize = if bh_type > 0x1 && bh_type < 0xD {
-            bh_type * size
-        } else {
-            size
-        };
-        let data_start = i + 4;
-        let data_end = data_start + msize;
-        let is_known_block = matches!(
-            idx,
-            METADATA_IDX | NB_TARGET_DETECTED_IDX | DISTANCE_IDX | TARGET_STATUS_IDX
-        );
-        if data_end > len {
-            if is_known_block {
-                return Err(FrameError::Truncated {
-                    offset: i,
-                    block_size: msize,
-                });
-            }
-            break;
-        }
-        let data = &buf[data_start..data_end];
-        match idx {
-            METADATA_IDX => {
-                if let Some(&t) = data.get(8) {
-                    frame.silicon_temp_degc = t as i8;
-                }
-            }
-            NB_TARGET_DETECTED_IDX => {
-                let n = data.len().min(ZONES_8X8);
-                frame.nb_target_detected[..n].copy_from_slice(&data[..n]);
-            }
-            DISTANCE_IDX => {
-                for (zone, pair) in frame.distance_mm.iter_mut().zip(data.chunks_exact(2)) {
-                    *zone = i16::from_le_bytes([pair[0], pair[1]]);
-                }
-            }
-            TARGET_STATUS_IDX => {
-                let n = data.len().min(ZONES_8X8);
-                frame.target_status[..n].copy_from_slice(&data[..n]);
-            }
-            _ => {}
-        }
-        i = data_end;
-    }
-
-    for d in frame.distance_mm.iter_mut() {
-        *d /= 4;
-        if *d < 0 {
-            *d = 0;
-        }
-    }
-
-    for (status, &nb) in frame
-        .target_status
-        .iter_mut()
-        .zip(frame.nb_target_detected.iter())
-    {
-        if nb == 0 {
-            *status = 255;
-        }
-    }
-
-    // In ST ULD, if header_id != footer_id it sets VL53L5CX_STATUS_CORRUPTED_FRAME
-    // advisory bit but does not discard the parsed ranging results.
-    // In 8x8 mode with minimal enables, footer_id is placed by microcode
-    // at a separate circular boundary, so we do not abort.
-    let _ = (buf[0x8], buf[len - 4]);
-    Ok(frame)
+    parse_frame_inner::<ZONES_8X8>(buf, false)
 }
 
 #[cfg(test)]
@@ -672,6 +638,37 @@ mod tests {
     use super::*;
     extern crate alloc;
     use alloc::{vec, vec::Vec};
+
+    #[test]
+    fn test_frame4x4_default_target_status_is_255() {
+        let frame = Frame4x4::default();
+        assert_eq!(frame.target_status, [255u8; ZONES_4X4]);
+        assert_eq!(frame.silicon_temp_degc, 0);
+        assert_eq!(frame.distance_mm, [0i16; ZONES_4X4]);
+        assert_eq!(frame.nb_target_detected, [0u8; ZONES_4X4]);
+    }
+
+    #[test]
+    fn test_const_dci_read_cmd() {
+        const CMD: [u8; 12] = dci_read_cmd(0x5440, 12);
+        assert_eq!(CMD[0], 0x54);
+        assert_eq!(CMD[1], 0x40);
+        assert_eq!(CMD[2], 0x00);
+        assert_eq!(CMD[3], 0xC0);
+    }
+
+    #[test]
+    fn test_generic_downsample_math() {
+        let mut grid_u32 = [100u32; 64];
+        downsample_u32_8x8_to_4x4(&mut grid_u32);
+        assert_eq!(grid_u32[0..16], [100u32; 16]);
+        assert_eq!(grid_u32[16..64], [0u32; 48]);
+
+        let mut grid_i16 = [-100i16; 64];
+        downsample_i16_8x8_to_4x4(&mut grid_i16);
+        assert_eq!(grid_i16[0..16], [-100i16; 16]);
+        assert_eq!(grid_i16[16..64], [0i16; 48]);
+    }
 
     #[test]
     fn swap_words_reverses_each_word() {
