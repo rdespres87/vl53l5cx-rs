@@ -840,6 +840,33 @@ mod tests {
         f
     }
 
+    fn synthetic_frame_8x8(stream_id: u16) -> Vec<u8> {
+        let cfg = build_output_config(64);
+        let mut f = vec![0u8; 16];
+        f[8..10].copy_from_slice(&stream_id.to_be_bytes());
+        push_block(&mut f, cfg.list[1], &{
+            let mut m = [0u8; 12];
+            m[8] = 42; // silicon temperature
+            m
+        });
+        push_block(&mut f, cfg.list[2], &[0u8; 4]);
+        let mut nb = [1u8; 64];
+        nb[63] = 0;
+        push_block(&mut f, cfg.list[5], &nb);
+        let mut dist = Vec::new();
+        for z in 0..64i16 {
+            let raw = if z == 5 { -20 } else { (200 + z) * 4 };
+            dist.extend_from_slice(&raw.to_le_bytes());
+        }
+        push_block(&mut f, cfg.list[8], &dist);
+        push_block(&mut f, cfg.list[10], &[5u8; 64]);
+        while f.len() < cfg.data_read_size as usize {
+            f.push(0);
+        }
+        swap_words(&mut f);
+        f
+    }
+
     #[test]
     fn parse_frame_decodes_minimal_4x4() {
         let mut raw = synthetic_frame(0x1234, 0x1234);
@@ -956,6 +983,65 @@ mod tests {
         assert_eq!(cfg.list[5], 0xDB84_0101); // NB_TARGET_DETECTED (size=16)
         assert_eq!(cfg.list[8], 0xDF44_0102); // DISTANCE (size=16)
         assert_eq!(cfg.list[10], 0xE084_0101); // TARGET_STATUS (size=16)
+    }
+
+    #[test]
+    fn parse_frame_decodes_8x8() {
+        let mut raw = synthetic_frame_8x8(0x5678);
+        assert_eq!(raw.len(), 320);
+        let Ok(frame) = parse_frame_8x8(&mut raw) else {
+            panic!("parse_frame_8x8 failed");
+        };
+        assert_eq!(frame.silicon_temp_degc, 42);
+        assert_eq!(frame.distance_mm[0], 200);
+        assert_eq!(frame.distance_mm[62], 262);
+        assert_eq!(frame.distance_mm[5], 0, "negative distance clamps to 0");
+        assert_eq!(frame.target_status[0], 5);
+        assert_eq!(frame.target_status[63], 255, "no target -> status 255");
+        assert_eq!(frame.nb_target_detected[0], 1);
+        assert_eq!(frame.nb_target_detected[63], 0);
+    }
+
+    #[test]
+    fn parse_frame_8x8_error_paths() {
+        let mut short = [0u8; 12];
+        assert_eq!(parse_frame_8x8(&mut short), Err(FrameError::TooShort(12)));
+
+        let mut unaligned = [0u8; 25];
+        assert_eq!(
+            parse_frame_8x8(&mut unaligned),
+            Err(FrameError::TooShort(25))
+        );
+
+        let mut raw = synthetic_frame_8x8(0x1234);
+        raw.truncate(64);
+        assert!(matches!(
+            parse_frame_8x8(&mut raw),
+            Err(FrameError::Truncated { .. })
+        ));
+    }
+
+    #[test]
+    fn prepare_offset_8x8_works() {
+        let mut buf = [0u8; 1024];
+        for (k, b) in buf.iter_mut().enumerate().take(NVM_DATA_SIZE) {
+            *b = (k % 251) as u8;
+        }
+        let original = buf;
+        assert!(prepare_offset_8x8(&mut buf).is_ok());
+        assert_eq!(&buf[0x1E0..0x1E8], &[0, 0, 0, 0x0F, 0x03, 0x01, 0x01, 0xE4]);
+        assert_eq!(&buf[0..8], &original[8..16]);
+        assert!(prepare_offset_8x8(&mut [0u8; 10]).is_err());
+    }
+
+    #[test]
+    fn output_config_8x8_structure() {
+        let cfg = build_output_config(64);
+        assert_eq!(cfg.data_read_size, 320);
+        assert!(verify_output_config(64, &cfg));
+        assert_eq!(cfg.list[5], 0xDB84_0401); // NB_TARGET_DETECTED (size=64)
+        assert_eq!(cfg.list[8], 0xDF44_0402); // DISTANCE (size=64)
+        assert_eq!(cfg.list[10], 0xE084_0401); // TARGET_STATUS (size=64)
     }
 
     #[test]
